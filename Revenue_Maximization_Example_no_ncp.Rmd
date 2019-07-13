@@ -1,0 +1,258 @@
+---
+title: "Revenue optimization"
+author: "Rob Trangucci & Jonah Gabry"
+date: "January 9, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rstan)
+library(dplyr)
+library(reshape2)
+library(bayesplot)
+library(ggplot2)
+```
+
+## Problem set-up
+
+Let's say that we're a data scientist at a large media company. We are told that
+we have the power to set prices for all streaming movies at whatever we want in
+order to maximize revenue. How should we go about learning how to maximize
+revenue for each movie? Our data might look like the number of movies sold per
+day, $y_{b,t}$ at a price $p_{b,t}$.
+
+Well, one way we could do this is to use the data we have to estimate the demand curve for the 
+products. The decision problem we want to solve is the following:
+
+\begin{align*}
+\arg\max_{p \in P} \mathbb{E}_q[q(p) \, p]
+\end{align*}
+
+Because we have complete control over price, the random variable contributing to the expectation
+is quantity. That's what we'll be modeling for these movies, the quantity as a function of price.
+
+The data is in a file called \texttt{movie_data.RDS}. Let's load the data and see what the structure
+is:
+
+```{r load-data}
+movie_data <- readRDS('movie_data.RDS')
+head(movie_data)
+```
+
+We've got the number of units sold, the title, the price (in US dollars), the release year and the 
+IMDB rating.
+
+```{r describe-data}
+N_titles <- length(unique(movie_data$title))
+N_titles
+```
+
+We're working with 20 titles. We should first want to learn whether price is
+related to quantity for our movies.
+
+We'll start with a simple model and build it up slowly. 
+
+\begin{align*}
+y_{b,t} & \sim \text{Poisson}(\mu_{b,t}) \\
+\mu_{b,t} & = \alpha + \beta \, p_{b,t}
+\end{align*}
+
+Let's prep the data. First, because we're concerned about comparing our
+predictions for certain products, and we'd like to do the comparison in Stan, we
+should convert our titles to integers.
+
+```{r prep-data}
+t <- max(table(movie_data$title))
+J <- length(unique(movie_data$title))
+movie_data <- movie_data %>%
+  mutate(title_fac = as.factor(title),
+         ttl_idx = as.integer(title_fac),
+         ids = rep(1:t,J),
+         wk_idx = lubridate::isoweek(date),
+         mo_idx = lubridate::month(date))
+```
+
+```{r stan-data}
+stan_dat_simple <- with(movie_data, list(qty_sld = units_sold,
+                                         price = price,
+                                         N = length(price),
+                                         J = J,
+                                         t = t,
+                                         M = length(unique(mo_idx)),
+                                         W = length(unique(wk_idx)),
+                                         ttl_idx = ttl_idx,
+                                         wk_idx = wk_idx,
+                                         mo_idx = mo_idx))
+```
+
+```{r comppoisdgp, cache=T, results="hide", message=FALSE}
+comp_dgp_simple <- stan_model('simple_poisson_regression_dgp.stan')
+```
+
+```{r runpoisdgp}
+fitted_model_dgp <- sampling(comp_dgp_simple, data = stan_dat_simple, chains = 1, cores = 1, iter = 1, algorithm='Fixed_param')
+samps_dgp <- rstan::extract(fitted_model_dgp)
+```
+
+```{r fake_stan_dat}
+stan_dat_fake <- with(movie_data, list(qty_sld = samps_dgp$y_gen[1,],
+                                             price = price,
+                                             N = length(price),
+                                             J = J,
+                                             t = t,
+                                             M = length(unique(mo_idx)),
+                                             W = length(unique(wk_idx)),
+                                             ttl_idx = ttl_idx,
+                                             wk_idx = wk_idx,
+                                            mo_idx = mo_idx))
+
+```
+
+```{r comppois, cache=T, results="hide", message=FALSE}
+comp_model_pois <- stan_model('simple_poisson_regression.stan')
+```
+
+```{r runpoisoverfake}
+fitted_model_pois <- sampling(comp_model_pois, data = stan_dat_fake, chains = 4, cores = 4)
+samps_pois <- rstan::extract(fitted_model_pois)
+```
+
+```{r}
+print(fitted_model_pois,pars=c('alpha','beta'))
+```
+
+```{r}
+hist(samps_pois$beta)
+```
+
+```{r runpois}
+fitted_model_pois <- sampling(comp_model_pois, data = stan_dat_simple, chains = 4, cores = 4)
+samps_pois <- rstan::extract(fitted_model_pois)
+```
+
+Let's look at our predictions vs. the data.
+
+```{r ppc-full}
+bayesplot::ppc_dens_overlay(stan_dat_simple$qty_sld, 
+                            samps_pois$pp_y[1:200,]) + xlim(c(0,50))
+```
+
+It appears that our data generating process that we've encoded in our model doesn't match the
+data we've been given. Are there other statistics we can look at to determine what's missing
+from the model?
+
+We can look at the errors in the means to see whether we're at least modeling the means well
+at the movie level.
+
+```{r ppc-group_means}
+bayesplot::ppc_stat_grouped(stan_dat_simple$qty_sld, 
+                            samps_pois$pp_y[1:200,], group = stan_dat_simple$ttl_idx, stat = 'mean')
+```
+
+In order to capture the movie-level means, let's add some more parameters to the generative
+model.
+
+\begin{align*}
+y_{b,t} & \sim \text{Poisson}(\mu_{b,t}) \\
+\mu_{b,t} & = \alpha_b + \beta \, p_{b,t} \\
+\alpha_b & \sim \text{Normal}(\alpha, \sigma_{\alpha})
+\end{align*}
+
+```{r comp-pois-hier, cache=T, results="hide", message=FALSE}
+comp_model_pois_hier <- stan_model('hier_poisson_regression.stan')
+```
+
+```{r run-pois-hier}
+fitted_model_pois_hier <- sampling(comp_model_pois_hier, data = stan_dat_simple, chains = 4, cores = 4)
+samps_pois_hier <- rstan::extract(fitted_model_pois_hier)
+```
+
+```{r ppc-full-hier}
+bayesplot::ppc_dens_overlay(stan_dat_simple$qty_sld, 
+                            samps_pois_hier$pp_y[1:200,]) + xlim(c(0,50))
+```
+
+```{r ppc-group_means-hier}
+bayesplot::ppc_stat_grouped(stan_dat_simple$qty_sld, 
+                            samps_pois_hier$pp_y[1:200,], group = stan_dat_simple$ttl_idx, stat = 'mean')
+```
+
+Ok, so these plots look \emph{much} better. There are still some things that
+look off about the chart though. Maybe adding a hierarchy to the price variable
+will help.
+
+\begin{align*}
+y_{b,t} & \sim \text{Poisson}(\mu_{b,t}) \\
+\mu_{b,t} & = \alpha_b + \beta_t \, p_{b,t} \\
+\alpha_b & \sim \text{Normal}(\alpha, \sigma_{\alpha})
+\beta_b & \sim \text{Normal}(\beta, \sigma_{\beta})
+\end{align*}
+
+```{r comp-pois-hier-slopes, cache=T, results="hide", message=FALSE}
+comp_model_pois_hier_slopes <- stan_model('hier_slopes_poisson_regression.stan')
+```
+
+```{r run-pois-hier-slopes}
+fitted_model_pois_hier_slopes <- sampling(comp_model_pois_hier_slopes, data = stan_dat_simple, chains = 4, cores = 4)
+samps_pois_hier_slopes <- rstan::extract(fitted_model_pois_hier_slopes)
+```
+
+```{r ppc-full-hier-slopes}
+bayesplot::ppc_dens_overlay(stan_dat_simple$qty_sld, 
+                            samps_pois_hier_slopes$pp_y[1:200,]) + xlim(c(0,100))
+```
+
+```{r ppc-group_max-hier-slopes-mean-by-mo}
+bayesplot::ppc_stat_grouped(stan_dat_simple$qty_sld, 
+                            samps_pois_hier_slopes$pp_y[1:200,], group = stan_dat_simple$mo_idx, stat = 'max')
+```
+
+We might be missing information in month
+
+```{r comp-pois-hier-mos, cache=T, results="hide", message=FALSE}
+comp_model_pois_hier_mos <- stan_model('hier_slopes_poisson_regression_mos.stan')
+```
+
+```{r run-pois-hier-slopes-mos}
+fitted_model_pois_hier_mos <- sampling(comp_model_pois_hier_mos, data = stan_dat_simple, chains = 4, cores = 4)
+samps_pois_hier_mos <- rstan::extract(fitted_model_pois_hier_mos)
+```
+
+```{r ppc-full-hier-mos}
+bayesplot::ppc_dens_overlay(stan_dat_simple$qty_sld, 
+                            samps_pois_hier_mos$pp_y[1:200,]) + xlim(c(0,100))
+```
+
+## Revenue forecasts
+
+Let's modify the Stan program to generate revenue forecasts at different prices in the
+last week of data.
+
+We want to predict quantity at each price, and then calculate revenue for each price.
+
+```{r comp-rev, cache=T, results="hide", message=FALSE}
+comp_rev <- stan_model('hier_slopes_poisson_regression_mos_predict.stan')
+```
+
+```{r run-pois-hier-rev}
+rev_model <- sampling(comp_rev, data = stan_dat_simple, chains = 4, cores = 4)
+samps_rev <- rstan::extract(rev_model)
+```
+
+```{r rev-curves}
+movie_map <- unique(movie_data[,c('title','ttl_idx')])
+median_rev <- apply(samps_rev$hypo_rev,c(2,3),median)
+lower_rev <- apply(samps_rev$hypo_rev,c(2,3),quantile,0.05)
+upper_rev <- apply(samps_rev$hypo_rev,c(2,3),quantile,0.95)
+rev_df <- data.frame(rev = as.vector(median_rev), lower = as.vector(lower_rev),
+                     upper = as.vector(upper_rev),
+                     price = rep(1:10,20),
+                     ttl_idx = as.vector(sapply(1:20,rep,10)))
+rev_df <- rev_df %>% left_join(movie_map, by = 'ttl_idx')
+ggplot(data = rev_df, aes(x = price, y = rev)) + geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill="grey70") + facet_wrap(~ title)
+```
+
